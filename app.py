@@ -5,6 +5,9 @@ import time
 from enum import Enum
 from typing import Any
 
+from concurrent.futures import ProcessPoolExecutor
+import os
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -32,9 +35,7 @@ PROFILE_FLAGS: dict[StressProfile, set[str]] = {
 }
 
 
-def cpu_work(duration: float) -> dict[str, Any]:
-    """Perform CPU-bound work for approximately the requested duration."""
-    duration = max(duration, 0.0)
+def _cpu_spin(duration: float) -> dict[str, float | int]:
     start = time.time()
     iterations = 0
 
@@ -49,10 +50,37 @@ def cpu_work(duration: float) -> dict[str, Any]:
             iterations += 1
 
     elapsed = time.time() - start
+    return {"elapsed_seconds": elapsed, "iterations": iterations}
+
+
+def cpu_work(duration: float, workers: int) -> dict[str, Any]:
+    """Perform CPU-bound work across up to `workers` processes."""
+    duration = max(duration, 0.0)
+    workers = max(1, workers)
+
+    if workers == 1:
+        stats = _cpu_spin(duration)
+        return {
+            "target_duration_seconds": round(duration, 3),
+            "elapsed_seconds": round(stats["elapsed_seconds"], 3),
+            "iterations": stats["iterations"],
+            "workers": workers,
+        }
+
+    max_workers = os.cpu_count() or 1
+    workers = min(workers, max_workers * 4)  # safety limit for runaway processes
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(_cpu_spin, [duration] * workers))
+
+    total_iterations = sum(result["iterations"] for result in results)
+    max_elapsed = max(result["elapsed_seconds"] for result in results)
+
     return {
         "target_duration_seconds": round(duration, 3),
-        "elapsed_seconds": round(elapsed, 3),
-        "iterations": iterations,
+        "elapsed_seconds": round(max_elapsed, 3),
+        "iterations": total_iterations,
+        "workers": workers,
     }
 
 
@@ -108,6 +136,7 @@ def _run_stress(
     memory: bool,
     network: bool,
     cpu_duration: float,
+    cpu_workers: int,
     memory_mb: int,
     memory_hold: float,
     network_mb: int,
@@ -118,7 +147,7 @@ def _run_stress(
     }
 
     if cpu:
-        stats["cpu"] = cpu_work(cpu_duration)
+        stats["cpu"] = cpu_work(cpu_duration, cpu_workers)
 
     if memory:
         stats["memory"] = memory_work(memory_mb, memory_hold)
@@ -139,7 +168,7 @@ def _run_stress(
 @app.get("/")
 def index() -> dict[str, Any]:
     """Default endpoint that performs CPU work similar to earlier behaviour."""
-    cpu_stats = cpu_work(1.0)
+    cpu_stats = cpu_work(1.0, 1)
     return {
         "message": "Request completed",
         "processing_time": cpu_stats["elapsed_seconds"],
@@ -159,6 +188,11 @@ def stress(
     network: bool = Query(False, description="Simulate outbound network traffic"),
     cpu_duration: float = Query(
         1.0, ge=0.0, description="Target CPU work duration in seconds"
+    ),
+    cpu_workers: int = Query(
+        1,
+        ge=1,
+        description="Number of parallel worker processes for CPU work",
     ),
     memory_mb: int = Query(
         128, ge=0, description="Megabytes of memory to allocate during the test"
@@ -184,6 +218,7 @@ def stress(
         memory=memory,
         network=network,
         cpu_duration=cpu_duration,
+        cpu_workers=cpu_workers,
         memory_mb=memory_mb,
         memory_hold=memory_hold,
         network_mb=network_mb,
@@ -195,6 +230,11 @@ def stress(
 def stress_profile(
     profile: StressProfile,
     cpu_duration: float = Query(1.0, ge=0.0, description="CPU duration in seconds"),
+    cpu_workers: int = Query(
+        1,
+        ge=1,
+        description="Number of parallel worker processes for CPU work",
+    ),
     memory_mb: int = Query(128, ge=0, description="Memory allocation in MB"),
     memory_hold: float = Query(1.0, ge=0.0, description="Hold allocated memory for N seconds"),
     network_mb: int = Query(5, ge=0, description="Payload size in MB for network stress"),
@@ -208,6 +248,7 @@ def stress_profile(
         memory="memory" in flags,
         network="network" in flags,
         cpu_duration=cpu_duration,
+        cpu_workers=cpu_workers,
         memory_mb=memory_mb,
         memory_hold=memory_hold,
         network_mb=network_mb,
