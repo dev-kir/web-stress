@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  web-stress:
+    image: web-stress:1
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+    ports:
+      - target: 7777
+        published: 7777
+        protocol: tcp
+    networks:
+      - pymonnet-net
+
+networks:
+  pymonnet-net:
+    external: true
