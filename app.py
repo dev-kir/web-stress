@@ -1,12 +1,12 @@
+import asyncio
 import json
 import math
 import random
 import time
-from enum import Enum
-from typing import Any
-
-from concurrent.futures import ProcessPoolExecutor
 import os
+from concurrent.futures import ProcessPoolExecutor
+from enum import Enum
+from typing import Any, Awaitable, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -106,31 +106,16 @@ def memory_work(megabytes: int, hold_seconds: float) -> dict[str, Any]:
     }
 
 
-def network_work(megabytes: int, chunk_kilobytes: int) -> tuple[dict[str, Any], Any]:
-    """Generate a stream of bytes to simulate outbound network traffic."""
+def network_work(megabytes: int, chunk_kilobytes: int) -> dict[str, int]:
+    """Return stats describing the intended network workload."""
     megabytes = max(megabytes, 0)
     chunk_kilobytes = max(chunk_kilobytes, 1)
     total_bytes = megabytes * 1024 * 1024
     chunk_bytes = chunk_kilobytes * 1024
-
-    def stream():
-        emitted = 0
-        chunk = b"x" * chunk_bytes
-        while emitted < total_bytes:
-            to_send = min(chunk_bytes, total_bytes - emitted)
-            yield chunk[:to_send]
-            emitted += to_send
-
-    iterator = stream() if total_bytes else iter(())
-    stats = {
-        "target_megabytes": megabytes,
-        "total_bytes": total_bytes,
-        "chunk_bytes": chunk_bytes,
-    }
-    return stats, iterator
+    return {"target_megabytes": megabytes, "total_bytes": total_bytes, "chunk_bytes": chunk_bytes}
 
 
-def _run_stress(
+async def _run_stress(
     *,
     cpu: bool,
     memory: bool,
@@ -142,25 +127,51 @@ def _run_stress(
     network_mb: int,
     network_chunk_kb: int,
 ):
-    stats: dict[str, Any] = {
-        "requested": {"cpu": cpu, "memory": memory, "network": network}
-    }
+    stats: dict[str, Any] = {"requested": {"cpu": cpu, "memory": memory, "network": network}}
+    loop = asyncio.get_running_loop()
+
+    cpu_future: Optional[Awaitable[dict[str, Any]]] = None
+    memory_future: Optional[Awaitable[dict[str, Any]]] = None
 
     if cpu:
-        stats["cpu"] = cpu_work(cpu_duration, cpu_workers)
+        cpu_future = loop.run_in_executor(None, cpu_work, cpu_duration, cpu_workers)
 
     if memory:
-        stats["memory"] = memory_work(memory_mb, memory_hold)
+        memory_future = loop.run_in_executor(None, memory_work, memory_mb, memory_hold)
 
     if network:
-        network_stats, payload = network_work(network_mb, network_chunk_kb)
+        network_stats = network_work(network_mb, network_chunk_kb)
         stats["network"] = network_stats
-        header_value = json.dumps(stats, separators=(",", ":"))
-        return StreamingResponse(
-            payload,
-            media_type="application/octet-stream",
-            headers={"X-Stress-Stats": header_value},
-        )
+
+        total_bytes = network_stats["total_bytes"]
+        chunk_bytes = network_stats["chunk_bytes"]
+        chunk = b"x" * chunk_bytes if chunk_bytes else b""
+
+        async def stream():
+            emitted = 0
+            while emitted < total_bytes:
+                to_send = min(chunk_bytes, total_bytes - emitted)
+                if to_send:
+                    yield chunk[:to_send]
+                    emitted += to_send
+                await asyncio.sleep(0)
+
+            if cpu_future:
+                stats["cpu"] = await cpu_future
+            if memory_future:
+                stats["memory"] = await memory_future
+
+            summary = json.dumps({"message": "stress execution complete", "stats": stats})
+            if summary:
+                prefix = b"\n" if total_bytes else b""
+                yield prefix + summary.encode()
+
+        return StreamingResponse(stream(), media_type="application/octet-stream")
+
+    if cpu_future:
+        stats["cpu"] = await cpu_future
+    if memory_future:
+        stats["memory"] = await memory_future
 
     return JSONResponse({"message": "stress execution complete", "stats": stats})
 
@@ -182,7 +193,7 @@ def health() -> dict[str, str]:
 
 
 @app.get("/stress")
-def stress(
+async def stress(
     cpu: bool = Query(False, description="Simulate CPU load"),
     memory: bool = Query(False, description="Simulate memory pressure"),
     network: bool = Query(False, description="Simulate outbound network traffic"),
@@ -213,7 +224,7 @@ def stress(
             detail="Select at least one stress type (cpu, memory, network).",
         )
 
-    return _run_stress(
+    return await _run_stress(
         cpu=cpu,
         memory=memory,
         network=network,
@@ -227,7 +238,7 @@ def stress(
 
 
 @app.get("/stress/profile/{profile}")
-def stress_profile(
+async def stress_profile(
     profile: StressProfile,
     cpu_duration: float = Query(1.0, ge=0.0, description="CPU duration in seconds"),
     cpu_workers: int = Query(
@@ -243,7 +254,7 @@ def stress_profile(
     ),
 ):
     flags = PROFILE_FLAGS[profile]
-    return _run_stress(
+    return await _run_stress(
         cpu="cpu" in flags,
         memory="memory" in flags,
         network="network" in flags,
